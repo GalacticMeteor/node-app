@@ -1,0 +1,318 @@
+---
+- name: Install DevOps Tools (Jenkins,Maven,Docker)
+  hosts: jenkins_docker
+  become: yes
+  vars:
+    maven_version: "3.9.5"
+    target_user: "root"
+  tasks:
+    # System Updates and Prerequisites
+    - name: Update and upgrade system packages
+      apt:
+        update_cache: yes
+        upgrade: yes
+        cache_valid_time: 3600
+    - name: Install system prerequisites
+      apt:
+        name:
+          - wget
+          - curl
+          - gnupg2
+          - software-properties-common
+          - apt-transport-https
+          - ca-certificates
+          - unzip
+          - git
+          - lsb-release
+        state: present
+    # Docker Installation
+    - name: Remove old Docker packages
+      apt:
+        name:
+          - docker
+          - docker-engine
+          - docker.io
+          - containerd
+          - runc
+        state: absent
+    - name: Download Docker GPG key
+      get_url:
+        url: https://download.docker.com/linux/ubuntu/gpg
+        dest: /tmp/docker.key
+        mode: '0644'
+    - name: Convert and install Docker GPG key
+      shell: gpg --dearmor -o /usr/share/keyrings/docker-archive-keyring.gpg /tmp/docker.key
+      args:
+        creates: /usr/share/keyrings/docker-archive-keyring.gpg
+    - name: Get Ubuntu codename for Docker repo
+      command: lsb_release -cs
+      register: ubuntu_codename_docker
+      changed_when: false
+    - name: Add Docker repository
+      apt_repository:
+        repo: "deb [arch=amd64 signed-by=/usr/share/keyrings/docker-archive-keyring.gpg] https://download.docker.com/linux/ubuntu {{ ubuntu_codename_docker.stdout }} stable"
+        state: present
+        filename: docker
+    - name: Update apt cache after adding Docker repo
+      apt:
+        update_cache: yes
+    - name: Install Docker Engine
+      apt:
+        name:
+          - docker-ce
+          - docker-ce-cli
+          - containerd.io
+          - docker-buildx-plugin
+          - docker-compose-plugin
+        state: present
+    - name: Start and enable Docker service
+      systemd:
+        name: docker
+        state: started
+        enabled: yes
+    - name: Create docker group (if not exists)
+      group:
+        name: docker
+        state: present
+    # Java Installation
+    - name: Install OpenJDK 17
+      apt:
+        name: openjdk-17-jdk
+        state: present
+    - name: Get Java path
+      shell: readlink -f $(which java) | sed "s:bin/java::"
+      register: java_path_result
+      changed_when: false
+    - name: Set JAVA_HOME in /etc/environment
+      lineinfile:
+        path: /etc/environment
+        line: "JAVA_HOME={{ java_path_result.stdout }}"
+        create: yes
+    - name: Set JAVA_HOME in Jenkins environment
+      lineinfile:
+        path: /etc/default/jenkins
+        line: "JAVA_HOME={{ java_path_result.stdout }}"
+        create: yes
+    - name: Export JAVA_HOME for current session
+      set_fact:
+        java_home: "{{ java_path_result.stdout }}"
+    # Jenkins Installation
+    - name: Download Jenkins GPG key
+      get_url:
+        url: https://pkg.jenkins.io/debian-stable/jenkins.io-2023.key
+        dest: /tmp/jenkins.key
+        mode: '0644'
+    - name: Convert and install Jenkins GPG key
+      shell: gpg --dearmor -o /usr/share/keyrings/jenkins-keyring.gpg /tmp/jenkins.key
+      args:
+        creates: /usr/share/keyrings/jenkins-keyring.gpg
+    - name: Add Jenkins repository
+      apt_repository:
+        repo: "deb [signed-by=/usr/share/keyrings/jenkins-keyring.gpg] https://pkg.jenkins.io/debian-stable binary/"
+        state: present
+        filename: jenkins
+    - name: Update apt cache after adding Jenkins repo
+      apt:
+        update_cache: yes
+    - name: Install Jenkins
+      apt:
+        name: jenkins
+        state: present
+    - name: Stop Jenkins service if running (to reconfigure)
+      systemd:
+        name: jenkins
+        state: stopped
+      failed_when: false
+    - name: Check Jenkins service status before starting
+      command: systemctl status jenkins.service
+      register: jenkins_status
+      failed_when: false
+      changed_when: false
+    - name: Debug Jenkins installation
+      debug:
+        var: jenkins_status.stdout_lines
+      when: jenkins_status.rc != 0
+    - name: Ensure Jenkins has proper Java configuration
+      lineinfile:
+        path: /etc/default/jenkins
+        regexp: '^JAVA_HOME='
+        line: "JAVA_HOME={{ java_path_result.stdout }}"
+    - name: Check if Jenkins user exists
+      command: id jenkins
+      register: jenkins_user_check
+      failed_when: false
+      changed_when: false
+    - name: Add Jenkins user to docker group
+      user:
+        name: jenkins
+        groups: docker
+        append: yes
+      when: jenkins_user_check.rc == 0
+    - name: Create Jenkins directories with proper permissions
+      file:
+        path: "{{ item }}"
+        state: directory
+        owner: jenkins
+        group: jenkins
+        mode: '0755'
+      loop:
+        - /var/lib/jenkins
+        - /var/cache/jenkins
+        - /var/log/jenkins
+      when: jenkins_user_check.rc == 0
+    - name: Check port 8080 availability
+      wait_for:
+        port: 8080
+        timeout: 1
+        state: stopped
+      ignore_errors: yes
+    - name: Kill any process using port 8080
+      shell: |
+        if lsof -ti:8080; then
+          kill -9 $(lsof -ti:8080)
+        fi
+      ignore_errors: yes
+    - name: Reset Jenkins service failures
+      command: systemctl reset-failed jenkins.service
+      failed_when: false
+    - name: Reload systemd daemon
+      systemd:
+        daemon_reload: yes
+    - name: Start Jenkins with retry
+      systemd:
+        name: jenkins
+        state: started
+      retries: 3
+      delay: 10
+      register: jenkins_start_result
+    - name: Enable Jenkins service
+      systemd:
+        name: jenkins
+        enabled: yes
+      when: jenkins_start_result is succeeded
+    - name: Check Jenkins logs if startup failed
+      command: journalctl -xeu jenkins.service --no-pager -n 50
+      register: jenkins_logs
+      when: jenkins_start_result is failed
+    - name: Display Jenkins error logs
+      debug:
+        var: jenkins_logs.stdout_lines
+      when: jenkins_start_result is failed
+    # Maven Installation
+    - name: Check if Maven is already installed
+      stat:
+        path: "/opt/apache-maven-{{ maven_version }}"
+      register: maven_installed
+    - name: Download Maven
+      get_url:
+        url: "https://archive.apache.org/dist/maven/maven-3/{{ maven_version }}/binaries/apache-maven-{{ maven_version }}-bin.tar.gz"
+        dest: "/tmp/apache-maven-{{ maven_version }}-bin.tar.gz"
+        mode: '0644'
+      when: not maven_installed.stat.exists
+    - name: Extract Maven
+      unarchive:
+        src: "/tmp/apache-maven-{{ maven_version }}-bin.tar.gz"
+        dest: /opt
+        remote_src: yes
+        owner: root
+        group: root
+      when: not maven_installed.stat.exists
+    - name: Create Maven symlink
+      file:
+        src: "/opt/apache-maven-{{ maven_version }}"
+        dest: /opt/maven
+        state: link
+    - name: Create Maven environment script
+      copy:
+        content: |
+          export MAVEN_HOME=/opt/maven
+          export M2_HOME=/opt/maven
+          export PATH=$PATH:$MAVEN_HOME/bin
+        dest: /etc/profile.d/maven.sh
+        mode: '0644'
+    # Docker post-installation verification and testing
+    - name: Test Docker installation
+      command: docker --version
+      register: docker_version
+      changed_when: false
+    - name: Test Docker service
+      command: docker info
+      register: docker_info
+      changed_when: false
+      failed_when: false
+    - name: Pull hello-world Docker image for testing
+      docker_image:
+        name: hello-world
+        source: pull
+      register: docker_pull_test
+      failed_when: false
+    # Firewall Configuration
+    - name: Configure UFW firewall rules
+      ufw:
+        rule: allow
+        port: "{{ item }}"
+        proto: tcp
+      loop:
+        - '22'    # SSH
+        - '8080'  # Jenkins
+        - '9000'  # SonarQube
+        - '5432'  # PostgreSQL (if needed for remote access)
+    - name: Allow SSH from anywhere (ensure we don't get locked out)
+      ufw:
+        rule: allow
+        name: OpenSSH
+    - name: Check if SSH port 22 is reachable
+      wait_for:
+        port: 22
+        state: started
+        timeout: 10
+      register: ssh_port_check
+      ignore_errors: yes
+
+    - name: Enable UFW firewall
+      ufw:
+        state: enabled
+        policy: deny
+        direction: incoming
+      when: ssh_port_check is succeeded
+    # Cleanup
+    - name: Clean up downloaded files
+      file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - "/tmp/apache-maven-{{ maven_version }}-bin.tar.gz"
+        - "/tmp/jenkins.key"
+        - "/tmp/docker.key"
+    # Information gathering
+    - name: Wait for Jenkins to start
+      wait_for:
+        port: 8080
+        delay: 30
+        timeout: 300
+    - name: Get Jenkins initial admin password
+      slurp:
+        src: /var/lib/jenkins/secrets/initialAdminPassword
+      register: jenkins_password
+      ignore_errors: yes
+    - name: Restart Jenkins to ensure Docker group membership is active
+      systemd:
+        name: jenkins
+        state: restarted
+      when: jenkins_user_check.rc == 0
+  handlers:
+    - name: reload sysctl
+      command: sysctl -p
+    - name: reload systemd
+      systemd:
+        daemon_reload: yes
+  post_tasks:
+    - name: Display installation summary
+      debug:
+        msg:
+          - "Installation complete!"
+          - "Jenkins: http://{{ ansible_default_ipv4.address }}:8080"
+          - "Docker version: {{ docker_version.stdout }}"
+          - "Jenkins initial password: {{ jenkins_password.content | b64decode | trim if jenkins_password is succeeded else 'Not available yet - check /var/lib/jenkins/secrets/initialAdminPassword' }}"
+          - "Jenkins user added to docker group - can run Docker commands"
+          - "Note: You may need to restart Jenkins after initial setup to ensure Docker group membership is active"
