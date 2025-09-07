@@ -8,7 +8,7 @@ pipeline {
         GITHUB_REPO = "https://github.com/GalacticMeteor/node-app.git"
         GITHUB_BRANCH = "main"
         EXPOSED_PORT = "9090"
-        CONTAINER_PORT = "8080"
+        CONTAINER_PORT = "3000"
     }
     
     stages {
