@@ -7,7 +7,7 @@ pipeline {
         CONTAINER_NAME = "my-app-${BUILD_NUMBER}"
         GITHUB_REPO = "https://github.com/GalacticMeteor/node-app.git"
         GITHUB_BRANCH = "main"
-        EXPOSED_PORT = "8080"
+        EXPOSED_PORT = "9090"
         CONTAINER_PORT = "8080"
     }
     
